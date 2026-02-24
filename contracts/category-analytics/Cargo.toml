@@ -7,7 +7,7 @@ repository.workspace = true
 description = "On-chain budget category analytics contract for StellarSpend"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
