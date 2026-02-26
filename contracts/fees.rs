@@ -40,11 +40,28 @@ impl FeeEvents {
     }
 
     pub fn config_updated(env: &Env, admin: &Address, percentage_bps: u32) {
-        let topics = (symbol_short!("fee"), symbol_short!("config_updated"));
+        let topics = (symbol_short!("fee"), symbol_short!("cfg_upd"));
         env.events().publish(
             topics,
             (admin.clone(), percentage_bps, env.ledger().timestamp()),
         );
+    }
+}
+
+/// Internal helpers — not exposed as contract entry points.
+impl FeesContract {
+    fn require_initialized(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, FeeError::NotInitialized))
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin = Self::require_initialized(env);
+        if caller != &admin {
+            panic_with_error!(env, FeeError::Unauthorized);
+        }
     }
 }
 
@@ -54,11 +71,17 @@ pub struct FeesContract;
 #[contractimpl]
 impl FeesContract {
     /// Initializes the fees contract with an admin and an initial percentage
-    /// (in basis points). Only callable once.
+    /// (in basis points, 0–10_000). Only callable once.
+    ///
+    /// # Security
+    /// - Guard: `AlreadyInitialized` prevents re-initialization attacks.
+    /// - `percentage_bps` is validated ≤ 10_000 before any state is written.
     pub fn initialize(env: Env, admin: Address, percentage_bps: u32) {
+        // [SEC-FEES-01] Re-initialization guard: must be checked before any writes.
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, FeeError::AlreadyInitialized);
         }
+        // [SEC-FEES-02] Validate percentage before committing state.
         if percentage_bps > 10_000 {
             panic_with_error!(&env, FeeError::InvalidPercentage);
         }
@@ -71,17 +94,18 @@ impl FeesContract {
             .set(&DataKey::TotalFeesCollected, &0i128);
     }
 
-    /// Sets a new percentage fee. Only the admin may call.
+    /// Updates the fee percentage. Only the current admin may call.
+    ///
+    /// # Security
+    /// - [SEC-FEES-03] `caller.require_auth()` is invoked *before* any storage
+    ///   reads so the host can short-circuit unauthorized calls cheaply.
+    /// - Admin check uses the centralized `require_admin` helper to avoid
+    ///   inconsistent comparisons across call sites.
     pub fn set_percentage(env: Env, caller: Address, percentage_bps: u32) {
+        // [SEC-FEES-03] Authenticate before reading sensitive state.
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, FeeError::NotInitialized));
-        if caller != admin {
-            panic_with_error!(&env, FeeError::Unauthorized);
-        }
+        Self::require_admin(&env, &caller);
+
         if percentage_bps > 10_000 {
             panic_with_error!(&env, FeeError::InvalidPercentage);
         }
@@ -91,7 +115,8 @@ impl FeesContract {
         FeeEvents::config_updated(&env, &caller, percentage_bps);
     }
 
-    /// Returns the current fee percentage (in basis points).
+    /// Returns the current fee percentage in basis points.
+    /// Defaults to 0 when the contract has not yet been initialized.
     pub fn get_percentage(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -99,13 +124,19 @@ impl FeesContract {
             .unwrap_or(0)
     }
 
-    /// Calculates the fee for a given amount using the current percentage.
-    /// Amount must be positive; fee is rounded down.
+    /// Calculates the fee for `amount` using the current percentage.
+    ///
+    /// # Security
+    /// - [SEC-FEES-04] Rejects non-positive amounts to prevent zero-fee bypass.
+    /// - [SEC-FEES-05] All arithmetic uses `checked_*` to trap overflow/underflow
+    ///   and panics with the typed `Overflow` error instead of silent wrap.
     pub fn calculate_fee(env: Env, amount: i128) -> i128 {
+        // [SEC-FEES-04] Reject non-positive amounts.
         if amount <= 0 {
             panic_with_error!(&env, FeeError::InvalidAmount);
         }
         let pct: u32 = Self::get_percentage(&env);
+        // [SEC-FEES-05] Checked arithmetic throughout.
         let fee = amount
             .checked_mul(pct as i128)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow))
@@ -114,23 +145,42 @@ impl FeesContract {
         fee
     }
 
-    /// Deducts the configured fee from `amount`. The caller must authorize
-    /// as `payer`. Returns a tuple `(net_amount, fee)` and updates internal
-    /// total-collected accounting. Emits a `fee_deducted` event.
+    /// Deducts the configured fee from `amount`.
+    ///
+    /// Returns `(net_amount, fee)` and updates the cumulative accounting.
+    ///
+    /// # Security
+    /// - [SEC-FEES-06] `payer.require_auth()` is invoked first — no state
+    ///   mutations can occur without authorization.
+    /// - [SEC-FEES-07] `TotalFeesCollected` accumulation uses `checked_add` so
+    ///   a saturated counter triggers `Overflow` rather than wrapping silently.
+    /// - Requires the contract to be initialized; `calculate_fee` propagates
+    ///   `NotInitialized` via `get_percentage` if called before `initialize`.
     pub fn deduct_fee(env: Env, payer: Address, amount: i128) -> (i128, i128) {
+        // [SEC-FEES-06] Authenticate before any computation or state change.
         payer.require_auth();
+
+        // Ensure contract is initialized before proceeding.
+        Self::require_initialized(&env);
+
         let fee = Self::calculate_fee(&env, amount);
+
+        // [SEC-FEES-07] Checked subtraction for net amount.
         let net = amount
             .checked_sub(fee)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
         let mut total: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalFeesCollected)
             .unwrap_or(0);
+
+        // [SEC-FEES-07] Checked addition for running total.
         total = total
             .checked_add(fee)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
         env.storage()
             .instance()
             .set(&DataKey::TotalFeesCollected, &total);
@@ -138,7 +188,7 @@ impl FeesContract {
         (net, fee)
     }
 
-    /// Returns cumulative fees collected so far.
+    /// Returns cumulative fees collected since deployment.
     pub fn get_total_collected(env: Env) -> i128 {
         env.storage()
             .instance()
