@@ -855,3 +855,309 @@ fn test_distribution_update_configuration() {
     assert_eq!(dist.len(), 2);
 }
 
+#[test]
+fn test_get_min_fee_default() {
+    let (env, _admin, client) = setup_fee_contract();
+    // Default min fee is 0
+    assert_eq!(client.get_min_fee(), 0);
+}
+
+#[test]
+fn test_get_max_fee_default() {
+    let (env, _admin, client) = setup_fee_contract();
+    // Default max fee is i128::MAX
+    assert_eq!(client.get_max_fee(), i128::MAX);
+}
+
+#[test]
+fn test_set_fee_bounds_valid() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    client.set_fee_bounds(&admin, &100, &1_000);
+    
+    assert_eq!(client.get_min_fee(), 100);
+    assert_eq!(client.get_max_fee(), 1_000);
+}
+
+#[test]
+fn test_set_fee_bounds_min_zero() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    client.set_fee_bounds(&admin, &0, &1_000);
+    
+    assert_eq!(client.get_min_fee(), 0);
+    assert_eq!(client.get_max_fee(), 1_000);
+}
+
+#[test]
+fn test_set_fee_bounds_equal() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Min and max can be equal
+    client.set_fee_bounds(&admin, &500, &500);
+    
+    assert_eq!(client.get_min_fee(), 500);
+    assert_eq!(client.get_max_fee(), 500);
+}
+
+#[test]
+fn test_set_fee_bounds_invalid_negative_min() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Should panic on negative min_fee
+    let result = std::panic::catch_unwind(|| {
+        client.set_fee_bounds(&admin, &-100, &1_000);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_fee_bounds_invalid_negative_max() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Should panic on negative max_fee
+    let result = std::panic::catch_unwind(|| {
+        client.set_fee_bounds(&admin, &100, &-1_000);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_fee_bounds_invalid_range() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Should panic when max < min
+    let result = std::panic::catch_unwind(|| {
+        client.set_fee_bounds(&admin, &1_000, &100);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_fee_bounds_unauthorized() {
+    let (env, admin, client) = setup_fee_contract();
+    let attacker = Address::generate(&env);
+    
+    // Should panic because attacker is not admin
+    let result = std::panic::catch_unwind(|| {
+        client.set_fee_bounds(&attacker, &100, &1_000);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_fee_bounds_emits_event() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    client.set_fee_bounds(&admin, &100, &1_000);
+    
+    let events = env.events().all();
+    assert!(events
+        .iter()
+        .any(|e| e.topics.0 == "fee" && e.topics.1 == "bounds_cfg"));
+}
+
+#[test]
+fn test_calculate_fee_with_min_bound() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Set min fee to 100
+    client.set_fee_bounds(&admin, &100, &i128::MAX);
+    
+    // Transaction with very small amount: 10 * 5% = 0.5, rounds to 0
+    // But min fee is 100, so fee should be at least 100
+    let fee = FeesContract::calculate_fee(env.clone(), 10);
+    assert_eq!(fee, 100);
+}
+
+#[test]
+fn test_calculate_fee_with_max_bound() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Set max fee to 100
+    client.set_fee_bounds(&admin, &0, &100);
+    
+    // Transaction with huge amount: 10_000 * 5% = 500
+    // But max fee is 100, so fee should be capped at 100
+    let fee = FeesContract::calculate_fee(env.clone(), 10_000);
+    assert_eq!(fee, 100);
+}
+
+#[test]
+fn test_calculate_fee_between_bounds() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Set bounds: min=50, max=150
+    client.set_fee_bounds(&admin, &50, &150);
+    
+    // Transaction with 2000: 2000 * 5% = 100
+    // 50 < 100 < 150, so fee is 100
+    let fee = FeesContract::calculate_fee(env.clone(), 2_000);
+    assert_eq!(fee, 100);
+}
+
+#[test]
+fn test_calculate_fee_min_and_max_equal() {
+    let (env, admin, client) = setup_fee_contract();
+    
+    // Fixed fee of 75
+    client.set_fee_bounds(&admin, &75, &75);
+    
+    // Any transaction should have fee = 75
+    assert_eq!(FeesContract::calculate_fee(env.clone(), 100), 75);
+    assert_eq!(FeesContract::calculate_fee(env.clone(), 10_000), 75);
+    assert_eq!(FeesContract::calculate_fee(env.clone(), 1_000), 75);
+}
+
+#[test]
+fn test_deduct_fee_respects_min_bound() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Set min fee to 200
+    client.set_fee_bounds(&admin, &200, &i128::MAX);
+    
+    // Transaction with small amount: 50 * 5% = 2.5, rounds to 2
+    // But min fee enforced, so fee should be 200
+    let (_net, fee) = client.deduct_fee(&user, &50);
+    assert_eq!(fee, 200);
+    assert_eq!(client.get_user_fees_accrued(&user), 200);
+    assert_eq!(client.get_total_collected(), 200);
+}
+
+#[test]
+fn test_deduct_fee_respects_max_bound() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Set max fee to 75
+    client.set_fee_bounds(&admin, &0, &75);
+    
+    // Transaction with 2000: 2000 * 5% = 100
+    // But max fee enforced, so fee should be 75
+    let (net, fee) = client.deduct_fee(&user, &2_000);
+    assert_eq!(fee, 75);
+    assert_eq!(net, 1_925);
+    assert_eq!(client.get_user_fees_accrued(&user), 75);
+    assert_eq!(client.get_total_collected(), 75);
+}
+
+#[test]
+fn test_multiple_transactions_with_bounds() {
+    let (env, admin, client) = setup_fee_contract();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    
+    // Set bounds: min=50, max=150
+    client.set_fee_bounds(&admin, &50, &150);
+    
+    // Small transaction (would be 5): should be 50 (min)
+    client.deduct_fee(&user1, &100);
+    assert_eq!(client.get_user_fees_accrued(&user1), 50);
+    
+    // Medium transaction (would be 100): should be 100
+    client.deduct_fee(&user2, &2_000);
+    assert_eq!(client.get_user_fees_accrued(&user2), 100);
+    
+    // Large transaction (would be 500): should be 150 (max)
+    client.deduct_fee(&user1, &10_000);
+    assert_eq!(client.get_user_fees_accrued(&user1), 200); // 50 + 150
+    
+    assert_eq!(client.get_total_collected(), 300); // 50 + 100 + 150
+}
+
+#[test]
+fn test_update_fee_bounds() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Initial bounds: min=100, max=200
+    client.set_fee_bounds(&admin, &100, &200);
+    client.deduct_fee(&user, &2_000); // 2000*5%=100, within bounds
+    assert_eq!(client.get_user_fees_accrued(&user), 100);
+    
+    // Update bounds: min=500, max=1000
+    client.set_fee_bounds(&admin, &500, &1_000);
+    client.deduct_fee(&user, &2_000); // 2000*5%=100, but min=500
+    assert_eq!(client.get_user_fees_accrued(&user), 600); // 100 + 500
+}
+
+#[test]
+fn test_fee_bounds_with_distribution() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    
+    // Set fee bounds
+    client.set_fee_bounds(&admin, &100, &200);
+    
+    // Set distribution
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1.clone(),
+        share_bps: 6_000,
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2.clone(),
+        share_bps: 4_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // Collect fees with bounds applied
+    client.deduct_fee(&user, &10_000); // 10_000*5%=500, capped at 200
+    assert_eq!(client.get_total_collected(), 200);
+    
+    // Distribute
+    client.distribute_fees(&admin);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient1), 120); // 200 * 60%
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient2), 80);  // 200 * 40%
+}
+
+#[test]
+fn test_fee_bounds_with_refunds() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Set min fee to 100
+    client.set_fee_bounds(&admin, &100, &i128::MAX);
+    
+    // Small transaction gets bumped to min: 100
+    client.deduct_fee(&user, &50);
+    assert_eq!(client.get_user_fees_accrued(&user), 100);
+    assert_eq!(client.get_total_collected(), 100);
+    
+    // Refund partially
+    client.refund_fee(&admin, &user, &30, &"partial");
+    assert_eq!(client.get_user_fees_accrued(&user), 70);
+    assert_eq!(client.get_total_collected(), 70);
+}
+
+#[test]
+fn test_large_transactions_exceed_percentage_fee() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Fee percentage: 5%, max fee capped at 1000
+    client.set_fee_bounds(&admin, &0, &1_000);
+    
+    // Transaction: 100_000 * 5% = 5_000, capped at 1_000
+    let (net, fee) = client.deduct_fee(&user, &100_000);
+    assert_eq!(fee, 1_000);
+    assert_eq!(net, 99_000);
+}
+
+#[test]
+fn test_very_small_transactions_with_min_fee() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Min fee: 50
+    client.set_fee_bounds(&admin, &50, &i128::MAX);
+    
+    // Transaction: 1 * 5% = 0, boosted to 50
+    let (net, fee) = client.deduct_fee(&user, &1);
+    assert_eq!(fee, 50);
+    assert_eq!(net, 1 - 50); // Negative is allowed for transaction logic
+}
+
