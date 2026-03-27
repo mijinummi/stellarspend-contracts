@@ -1,13 +1,13 @@
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _},
-    Address, Env,
+    Address, Env, Vec,
 };
 
 #[path = "../contracts/fees.rs"]
 mod fees;
 
-use fees::{FeeError, FeesContract, FeesContractClient};
+use fees::{FeeError, FeeRecipient, FeesContract, FeesContractClient};
 
 fn setup_fee_contract() -> (Env, Address, FeesContractClient<'static>) {
     let env = Env::default();
@@ -411,5 +411,447 @@ fn test_refund_fee_alternate_refund_reasons() {
     
     assert_eq!(client.get_user_fees_accrued(&user), 0);
     assert_eq!(client.get_total_collected(), 0);
+}
+
+#[test]
+fn test_get_distribution_empty_default() {
+    let (env, _admin, client) = setup_fee_contract();
+    let dist = client.get_distribution();
+    assert_eq!(dist.len(), 0);
+}
+
+#[test]
+fn test_set_distribution_single_recipient() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient.clone(),
+        share_bps: 10_000, // 100%
+    });
+    
+    client.set_distribution(&admin, &recipients);
+    
+    let dist = client.get_distribution();
+    assert_eq!(dist.len(), 1);
+    assert_eq!(dist.get(0).unwrap().share_bps, 10_000);
+}
+
+#[test]
+fn test_set_distribution_multiple_recipients() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    let recipient3 = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1,
+        share_bps: 5_000, // 50%
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2,
+        share_bps: 3_000, // 30%
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient3,
+        share_bps: 2_000, // 20%
+    });
+    
+    client.set_distribution(&admin, &recipients);
+    
+    let dist = client.get_distribution();
+    assert_eq!(dist.len(), 3);
+}
+
+#[test]
+fn test_set_distribution_invalid_empty() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipients = Vec::new(&env);
+    
+    // Should panic on empty distribution
+    let result = std::panic::catch_unwind(|| {
+        client.set_distribution(&admin, &recipients);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_distribution_invalid_sum_less_than_100() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1,
+        share_bps: 5_000, // 50%
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2,
+        share_bps: 3_000, // 30% => total 80%
+    });
+    
+    // Should panic because total < 100%
+    let result = std::panic::catch_unwind(|| {
+        client.set_distribution(&admin, &recipients);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_distribution_invalid_sum_more_than_100() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1,
+        share_bps: 6_000, // 60%
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2,
+        share_bps: 5_000, // 50% => total 110%
+    });
+    
+    // Should panic because total > 100%
+    let result = std::panic::catch_unwind(|| {
+        client.set_distribution(&admin, &recipients);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_distribution_invalid_share_exceeds_100() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient,
+        share_bps: 15_000, // > 10_000 invalid
+    });
+    
+    // Should panic because individual share > 100%
+    let result = std::panic::catch_unwind(|| {
+        client.set_distribution(&admin, &recipients);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_distribution_unauthorized() {
+    let (env, admin, client) = setup_fee_contract();
+    let attacker = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient,
+        share_bps: 10_000,
+    });
+    
+    // Should panic because attacker is not admin
+    let result = std::panic::catch_unwind(|| {
+        client.set_distribution(&attacker, &recipients);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_distribution_emits_event() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient,
+        share_bps: 10_000,
+    });
+    
+    client.set_distribution(&admin, &recipients);
+    
+    let events = env.events().all();
+    assert!(events
+        .iter()
+        .any(|e| e.topics.0 == "fee" && e.topics.1 == "dist_cfg"));
+}
+
+#[test]
+fn test_distribute_fees_no_distribution_configured() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    
+    // Pay fees without setting distribution
+    client.deduct_fee(&user, &1_000); // fee = 50
+    
+    // Should panic because distribution not configured
+    let result = std::panic::catch_unwind(|| {
+        client.distribute_fees(&admin);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_distribute_fees_zero_collected() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient.clone(),
+        share_bps: 10_000,
+    });
+    
+    client.set_distribution(&admin, &recipients);
+    
+    // No fees collected, distribution should return 0
+    let distributed = client.distribute_fees(&admin);
+    assert_eq!(distributed, 0);
+}
+
+#[test]
+fn test_distribute_fees_single_recipient() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    // Set distribution
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient.clone(),
+        share_bps: 10_000, // 100%
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // Collect fees
+    client.deduct_fee(&user, &2_000); // fee = 100
+    assert_eq!(client.get_total_collected(), 100);
+    
+    // Distribute
+    let distributed = client.distribute_fees(&admin);
+    assert_eq!(distributed, 100);
+    
+    // Verify recipient received all fees
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient), 100);
+    
+    // Verify total fees cleared
+    assert_eq!(client.get_total_collected(), 0);
+}
+
+#[test]
+fn test_distribute_fees_multiple_recipients_equal_split() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    
+    // Set distribution: 50% each
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1.clone(),
+        share_bps: 5_000,
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2.clone(),
+        share_bps: 5_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // Collect fees: 1_000 * 5% = 50
+    client.deduct_fee(&user, &1_000);
+    assert_eq!(client.get_total_collected(), 50);
+    
+    // Distribute
+    let distributed = client.distribute_fees(&admin);
+    assert_eq!(distributed, 50);
+    
+    // Verify split: 50 * 50% = 25 each
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient1), 25);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient2), 25);
+}
+
+#[test]
+fn test_distribute_fees_multiple_recipients_unequal_split() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    let recipient3 = Address::generate(&env);
+    
+    // Set distribution: 50%, 30%, 20%
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1.clone(),
+        share_bps: 5_000,
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2.clone(),
+        share_bps: 3_000,
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient3.clone(),
+        share_bps: 2_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // Collect fees: 1_000 * 5% = 50
+    client.deduct_fee(&user, &1_000);
+    
+    // Distribute
+    let distributed = client.distribute_fees(&admin);
+    assert_eq!(distributed, 50);
+    
+    // Verify distribution
+    // recipient1: 50 * 50% = 25
+    // recipient2: 50 * 30% = 15
+    // recipient3: 50 * 20% = 10
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient1), 25);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient2), 15);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient3), 10);
+}
+
+#[test]
+fn test_distribute_fees_multiple_distributions_accumulates() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    // Set distribution: 100% to recipient
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient.clone(),
+        share_bps: 10_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // First fee collection and distribution
+    client.deduct_fee(&user, &1_000); // fee = 50
+    client.distribute_fees(&admin);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient), 50);
+    
+    // Second fee collection and distribution
+    client.deduct_fee(&user, &1_000); // fee = 50
+    client.distribute_fees(&admin);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient), 100);
+    
+    // Third fee collection and distribution
+    client.deduct_fee(&user, &2_000); // fee = 100
+    client.distribute_fees(&admin);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient), 200);
+}
+
+#[test]
+fn test_distribute_fees_unauthorized() {
+    let (env, admin, client) = setup_fee_contract();
+    let attacker = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient,
+        share_bps: 10_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // Should panic because attacker is not admin
+    let result = std::panic::catch_unwind(|| {
+        client.distribute_fees(&attacker);
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_distribute_fees_emits_event() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient,
+        share_bps: 10_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    client.deduct_fee(&user, &1_000);
+    client.distribute_fees(&admin);
+    
+    let events = env.events().all();
+    assert!(events
+        .iter()
+        .any(|e| e.topics.0 == "fee" && e.topics.1 == "distributed"));
+}
+
+#[test]
+fn test_get_recipient_fees_accumulated_zero_default() {
+    let (env, _admin, client) = setup_fee_contract();
+    let recipient = Address::generate(&env);
+    
+    // Recipient with no distributions should return 0
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient), 0);
+}
+
+#[test]
+fn test_distribution_with_refunds_before_distribution() {
+    let (env, admin, client) = setup_fee_contract();
+    let user = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    // Set distribution
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient.clone(),
+        share_bps: 10_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    // Collect fees: fee = 50
+    client.deduct_fee(&user, &1_000);
+    assert_eq!(client.get_total_collected(), 50);
+    
+    // Refund partial fee: 20
+    client.refund_fee(&admin, &user, &20, &"partial_cancel");
+    assert_eq!(client.get_total_collected(), 30);
+    
+    // Distribute remaining
+    let distributed = client.distribute_fees(&admin);
+    assert_eq!(distributed, 30);
+    assert_eq!(client.get_recipient_fees_accumulated(&recipient), 30);
+}
+
+#[test]
+fn test_distribution_update_configuration() {
+    let (env, admin, client) = setup_fee_contract();
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    
+    // Initial distribution
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1.clone(),
+        share_bps: 10_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    let dist = client.get_distribution();
+    assert_eq!(dist.len(), 1);
+    
+    // Update distribution to split
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(FeeRecipient {
+        address: recipient1.clone(),
+        share_bps: 6_000,
+    });
+    recipients.push_back(FeeRecipient {
+        address: recipient2.clone(),
+        share_bps: 4_000,
+    });
+    client.set_distribution(&admin, &recipients);
+    
+    let dist = client.get_distribution();
+    assert_eq!(dist.len(), 2);
 }
 
