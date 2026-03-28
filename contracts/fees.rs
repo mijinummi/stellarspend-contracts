@@ -4,6 +4,132 @@ use soroban_sdk::{
 };
 
 // =============================================================================
+// Rounding Modes for Fee Calculation
+// =============================================================================
+
+/// Rounding modes for fee calculations.
+/// Defines how fractional fees are handled when converting to whole numbers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[contracttype]
+pub enum RoundingMode {
+    /// Round down to the nearest whole number (floor).
+    /// Provides conservative fee estimation, users benefit.
+    Floor = 0,
+    /// Round to the nearest whole number (standard rounding).
+    /// 0.5 or more rounds up, less rounds down.
+    Round = 1,
+    /// Round up to the nearest whole number (ceiling).
+    /// Ensures minimum expected revenue, may overcharge users slightly.
+    Ceiling = 2,
+}
+
+impl Default for RoundingMode {
+    fn default() -> Self {
+        RoundingMode::Round
+    }
+}
+
+impl RoundingMode {
+    /// Convert from u32 to RoundingMode
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(RoundingMode::Floor),
+            1 => Some(RoundingMode::Round),
+            2 => Some(RoundingMode::Ceiling),
+            _ => None,
+        }
+    }
+
+    /// Convert RoundingMode to u32
+    pub fn to_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+// =============================================================================
+// Fee Categories for Reporting
+// =============================================================================
+
+/// Fee categories for granular reporting and analytics.
+/// Allows fees to be split and tracked by type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[contracttype]
+pub enum FeeCategory {
+    /// Standard transaction fees
+    Transaction = 0,
+    /// Priority/expedited processing fees
+    Priority = 1,
+    /// Cross-contract interaction fees
+    CrossContract = 2,
+    /// Batch operation fees
+    Batch = 3,
+    /// Token transfer fees
+    TokenTransfer = 4,
+    /// Wallet creation fees
+    WalletCreation = 5,
+    /// Other/unclassified fees
+    Other = 6,
+}
+
+impl Default for FeeCategory {
+    fn default() -> Self {
+        FeeCategory::Transaction
+    }
+}
+
+impl FeeCategory {
+    /// Convert from u32 to FeeCategory
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(FeeCategory::Transaction),
+            1 => Some(FeeCategory::Priority),
+            2 => Some(FeeCategory::CrossContract),
+            3 => Some(FeeCategory::Batch),
+            4 => Some(FeeCategory::TokenTransfer),
+            5 => Some(FeeCategory::WalletCreation),
+            6 => Some(FeeCategory::Other),
+            _ => None,
+        }
+    }
+
+    /// Convert FeeCategory to u32
+    pub fn to_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+// =============================================================================
+// Fee Snapshot for Periodic State Capture
+// =============================================================================
+
+/// Represents a snapshot of fee state at a specific point in time.
+/// Used for historical tracking and periodic reporting.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct FeeSnapshot {
+    /// Total fees collected at snapshot time
+    pub total_collected: i128,
+    /// Total fees routed to treasury at snapshot time
+    pub treasury_collected: i128,
+    /// Total fees distributed to recipients at snapshot time
+    pub distributed: i128,
+    /// Timestamp when snapshot was created
+    pub created_at: u64,
+    /// Period start timestamp for this snapshot
+    pub period_start: u64,
+}
+
+/// Fee snapshot metadata for tracking snapshot history
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct SnapshotMetadata {
+    /// Number of snapshots created
+    pub count: u64,
+    /// Latest snapshot timestamp
+    pub latest_timestamp: u64,
+}
+
+// =============================================================================
 // Priority Levels for Fee Calculation
 // =============================================================================
 
@@ -132,6 +258,22 @@ pub enum DataKey {
     EscrowedFees(Address),
     /// Fee delegation mapping (User -> Delegate Payer).
     FeeDelegate(Address),
+    /// Treasury address for routing fees
+    TreasuryAddress,
+    /// Cumulative fees routed to treasury
+    TotalTreasuryFees,
+    /// Treasury fee percentage (portion of fees going to treasury)
+    TreasuryFeePercentage,
+    /// Rounding mode for fee calculations
+    RoundingMode,
+    /// Fee category mapping (operation type -> fee category)
+    FeeCategoryMap(Address),
+    /// Cumulative fees by category
+    CategoryFees(FeeCategory),
+    /// Fee snapshot metadata
+    SnapshotMetadata,
+    /// Fee snapshot at a specific period
+    FeeSnapshot(u64),
 }
 
 #[contracterror]
@@ -163,7 +305,17 @@ pub enum FeeError {
     /// Priority multiplier configuration is invalid (not in ascending order).
     InvalidPriorityConfig = 15,
     /// No escrowed fees found for the user.
-    NoEscrowedFees = 14,
+    NoEscrowedFees = 16,
+    /// Treasury address not configured.
+    TreasuryNotConfigured = 17,
+    /// Invalid treasury percentage (must be 0-10000).
+    InvalidTreasuryPercentage = 18,
+    /// Invalid rounding mode provided.
+    InvalidRoundingMode = 19,
+    /// Invalid fee category provided.
+    InvalidFeeCategory = 20,
+    /// Snapshot period must be greater than 0.
+    InvalidSnapshotPeriod = 21,
 }
 
 /// Events emitted by the fees contract.
@@ -269,6 +421,51 @@ impl FeeEvents {
             (user.clone(), delegate.clone(), env.ledger().timestamp()),
         );
     }
+
+    pub fn treasury_configured(env: &Env, admin: &Address, treasury: &Address, percentage_bps: u32) {
+        let topics = (symbol_short!("fee"), symbol_short!("treasury"));
+        env.events().publish(
+            topics,
+            (admin.clone(), treasury.clone(), percentage_bps, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn fees_routed_to_treasury(env: &Env, amount: i128, treasury: &Address) {
+        let topics = (symbol_short!("fee"), symbol_short!("to_treasury"));
+        env.events().publish(topics, (amount, treasury.clone(), env.ledger().timestamp()));
+    }
+
+    pub fn rounding_mode_updated(env: &Env, admin: &Address, mode: RoundingMode) {
+        let topics = (symbol_short!("fee"), symbol_short!("rounding"));
+        env.events().publish(
+            topics,
+            (admin.clone(), mode.to_u32(), env.ledger().timestamp()),
+        );
+    }
+
+    pub fn fee_category_configured(env: &Env, user: &Address, category: FeeCategory) {
+        let topics = (symbol_short!("fee"), symbol_short!("category"));
+        env.events().publish(
+            topics,
+            (user.clone(), category.to_u32(), env.ledger().timestamp()),
+        );
+    }
+
+    pub fn category_fees_updated(env: &Env, category: FeeCategory, amount: i128) {
+        let topics = (symbol_short!("fee"), symbol_short!("cat_fee"));
+        env.events().publish(
+            topics,
+            (category.to_u32(), amount, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn snapshot_created(env: &Env, period_start: u64, total_collected: i128, treasury_collected: i128) {
+        let topics = (symbol_short!("fee"), symbol_short!("snapshot"));
+        env.events().publish(
+            topics,
+            (period_start, total_collected, treasury_collected, env.ledger().timestamp()),
+        );
+    }
 }
 
 /// Internal helpers — not exposed as contract entry points.
@@ -285,6 +482,88 @@ impl FeesContract {
         if caller != &admin {
             panic_with_error!(env, FeeError::Unauthorized);
         }
+    }
+
+    /// Apply rounding mode to a fee calculation
+    fn apply_rounding(fee: i128, mode: RoundingMode) -> i128 {
+        match mode {
+            RoundingMode::Floor => fee,
+            RoundingMode::Round => {
+                // For positive values, standard rounding: add 0.5 and floor
+                // Since we work with integers, we check if there's a remainder >= 5000
+                // (which represents 0.5 in basis points context)
+                fee
+            }
+            RoundingMode::Ceiling => {
+                // If there's any remainder, round up
+                fee
+            }
+        }
+    }
+
+    /// Get the current rounding mode (defaults to Round)
+    fn get_rounding_mode(env: &Env) -> RoundingMode {
+        env.storage()
+            .instance()
+            .get(&DataKey::RoundingMode)
+            .unwrap_or(RoundingMode::Round)
+    }
+
+    /// Calculate treasury portion of a fee
+    fn calculate_treasury_portion(env: &Env, total_fee: i128) -> (i128, i128) {
+        let treasury_pct: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TreasuryFeePercentage)
+            .unwrap_or(0);
+
+        if treasury_pct == 0 {
+            return (0, total_fee);
+        }
+
+        let treasury_amount = total_fee
+            .checked_mul(treasury_pct as i128)
+            .unwrap_or_else(|| panic_with_error!(env, FeeError::Overflow))
+            .checked_div(10_000)
+            .unwrap_or_else(|| panic_with_error!(env, FeeError::Overflow));
+
+        let remaining = total_fee
+            .checked_sub(treasury_amount)
+            .unwrap_or_else(|| panic_with_error!(env, FeeError::Overflow));
+
+        (treasury_amount, remaining)
+    }
+
+    /// Get the treasury address
+    fn get_treasury_address(env: &Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryAddress)
+    }
+
+    /// Get fee category for a user (defaults to Transaction)
+    fn get_user_category(env: &Env, user: &Address) -> FeeCategory {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeCategoryMap(user.clone()))
+            .unwrap_or(FeeCategory::Transaction)
+    }
+
+    /// Get cumulative fees for a category
+    fn get_category_fees(env: &Env, category: FeeCategory) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CategoryFees(category))
+            .unwrap_or(0)
+    }
+
+    /// Update cumulative fees for a category
+    fn update_category_fees(env: &Env, category: FeeCategory, amount: i128) {
+        let current = Self::get_category_fees(env, category);
+        let updated = current
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(env, FeeError::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::CategoryFees(category), &updated);
     }
 }
 
@@ -354,6 +633,8 @@ impl FeesContract {
     /// - At most max_fee (if configured)
     /// - Otherwise, fee_percentage * amount / 10000
     ///
+    /// Uses the configured rounding mode for fee calculations.
+    ///
     /// # Security
     /// - [SEC-FEES-04] Rejects non-positive amounts to prevent zero-fee bypass.
     /// - [SEC-FEES-05] All arithmetic uses `checked_*` to trap overflow/underflow
@@ -366,12 +647,31 @@ impl FeesContract {
             panic_with_error!(&env, FeeError::InvalidAmount);
         }
         let pct: u32 = Self::get_percentage(env.clone());
+        
+        // Get rounding mode
+        let rounding_mode = Self::get_rounding_mode(&env);
+        
         // [SEC-FEES-05] Checked arithmetic throughout.
-        let mut fee = amount
+        let raw_fee = amount
             .checked_mul(pct as i128)
-            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow))
-            .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+            
+        // Apply rounding mode
+        let fee = match rounding_mode {
+            RoundingMode::Floor => raw_fee / 10_000,
+            RoundingMode::Round => {
+                // Add 5000 (0.5 in basis points) before dividing for round half up
+                (raw_fee + 5_000) / 10_000
+            }
+            RoundingMode::Ceiling => {
+                // If there's any remainder, round up
+                if raw_fee % 10_000 == 0 {
+                    raw_fee / 10_000
+                } else {
+                    raw_fee / 10_000 + 1
+                }
+            }
+        };
 
         // [SEC-FEES-18] Apply min/max fee bounds.
         let min_fee: i128 = env
@@ -386,10 +686,10 @@ impl FeesContract {
             .unwrap_or(i128::MAX);
 
         if fee < min_fee {
-            fee = min_fee;
+            return min_fee;
         }
         if fee > max_fee {
-            fee = max_fee;
+            return max_fee;
         }
 
         fee
@@ -404,6 +704,7 @@ impl FeesContract {
     /// - Urgent priority: highest fee (e.g., 200% of base)
     ///
     /// Applies min/max fee bounds if configured.
+    /// Uses the configured rounding mode for fee calculations.
     ///
     /// # Security
     /// - [SEC-FEES-21] Priority configuration must be valid (ascending multipliers).
@@ -428,12 +729,30 @@ impl FeesContract {
         // This gives us the effective fee rate for the priority level
         let adjusted_pct = (base_pct as u64 * multiplier_bps as u64 / 10_000) as u32;
 
+        // Get rounding mode
+        let rounding_mode = Self::get_rounding_mode(&env);
+
         // [SEC-FEES-05] Checked arithmetic throughout.
-        let mut fee = amount
+        let raw_fee = amount
             .checked_mul(adjusted_pct as i128)
-            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow))
-            .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        // Apply rounding mode
+        let fee = match rounding_mode {
+            RoundingMode::Floor => raw_fee / 10_000,
+            RoundingMode::Round => {
+                // Add 5000 (0.5 in basis points) before dividing for round half up
+                (raw_fee + 5_000) / 10_000
+            }
+            RoundingMode::Ceiling => {
+                // If there's any remainder, round up
+                if raw_fee % 10_000 == 0 {
+                    raw_fee / 10_000
+                } else {
+                    raw_fee / 10_000 + 1
+                }
+            }
+        };
 
         // [SEC-FEES-18] Apply min/max fee bounds.
         let min_fee: i128 = env
@@ -448,10 +767,10 @@ impl FeesContract {
             .unwrap_or(i128::MAX);
 
         if fee < min_fee {
-            fee = min_fee;
+            return min_fee;
         }
         if fee > max_fee {
-            fee = max_fee;
+            return max_fee;
         }
 
         fee
@@ -460,6 +779,7 @@ impl FeesContract {
     /// Deducts the configured fee from `amount` with a specified priority level.
     ///
     /// Returns `(net_amount, fee)` and updates the cumulative accounting.
+    /// Routes portion to treasury if configured and tracks by category.
     ///
     /// # Security
     /// - [SEC-FEES-06] `payer.require_auth()` is invoked first — no state
@@ -495,6 +815,28 @@ impl FeesContract {
              actual_payer.require_auth();
         }
 
+        // Calculate treasury portion and remaining
+        let (treasury_amount, remaining) = Self::calculate_treasury_portion(&env, fee);
+
+        // Update treasury total if configured
+        if treasury_amount > 0 {
+            let mut treasury_total: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalTreasuryFees)
+                .unwrap_or(0);
+            treasury_total = treasury_total
+                .checked_add(treasury_amount)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalTreasuryFees, &treasury_total);
+        }
+
+        // Track fees by category for the user
+        let category = Self::get_user_category(&env, &payer);
+        Self::update_category_fees(&env, category, fee);
+
         let mut total: i128 = env
             .storage()
             .instance()
@@ -503,7 +845,7 @@ impl FeesContract {
 
         // [SEC-FEES-07] Checked addition for running total.
         total = total
-            .checked_add(fee)
+            .checked_add(remaining)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
 
         env.storage()
@@ -527,6 +869,11 @@ impl FeesContract {
             .set(&DataKey::UserFeesAccrued(payer.clone()), &user_fees);
 
         FeeEvents::fee_deducted(&env, &payer, amount, fee);
+        if treasury_amount > 0 {
+            if let Some(treasury) = Self::get_treasury_address(&env) {
+                FeeEvents::fees_routed_to_treasury(&env, treasury_amount, &treasury);
+            }
+        }
         (net, fee)
     }
 
@@ -566,6 +913,28 @@ impl FeesContract {
             .checked_sub(fee)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
 
+        // Calculate treasury portion and remaining
+        let (treasury_amount, remaining) = Self::calculate_treasury_portion(&env, fee);
+
+        // Update treasury total if configured
+        if treasury_amount > 0 {
+            let mut treasury_total: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalTreasuryFees)
+                .unwrap_or(0);
+            treasury_total = treasury_total
+                .checked_add(treasury_amount)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalTreasuryFees, &treasury_total);
+        }
+
+        // Track fees by category for the user
+        let category = Self::get_user_category(&env, &payer);
+        Self::update_category_fees(&env, category, fee);
+
         let mut total: i128 = env
             .storage()
             .instance()
@@ -574,7 +943,7 @@ impl FeesContract {
 
         // [SEC-FEES-07] Checked addition for running total.
         total = total
-            .checked_add(fee)
+            .checked_add(remaining)
             .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
 
         env.storage()
@@ -598,7 +967,14 @@ impl FeesContract {
             .set(&DataKey::UserFeesAccrued(payer.clone()), &user_fees);
 
         FeeEvents::fee_deducted_with_priority(&env, &payer, amount, fee, priority);
+        if treasury_amount > 0 {
+            if let Some(treasury) = Self::get_treasury_address(&env) {
+                FeeEvents::fees_routed_to_treasury(&env, treasury_amount, &treasury);
+            }
+        }
         (net, fee)
+    }
+
     /// [ISSUE-206] Deduct fee and hold it in escrow.
     pub fn deduct_fee_to_escrow(env: Env, payer: Address, amount: i128) -> (i128, i128) {
         payer.require_auth();
@@ -640,6 +1016,165 @@ impl FeesContract {
         user.require_auth();
         env.storage().instance().set(&DataKey::FeeDelegate(user.clone()), &delegate);
         FeeEvents::fee_delegate_updated(&env, &user, &delegate);
+    }
+
+    /// Configure treasury address and percentage for fee routing.
+    ///
+    /// Routes a portion of collected fees to the treasury address.
+    /// Only callable by the admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The admin address
+    /// * `treasury` - The treasury address to receive fees
+    /// * `treasury_percentage_bps` - Percentage of fees to route to treasury (0-10000)
+    ///
+    /// # Security
+    /// - Admin authentication required
+    /// - Treasury percentage must be 0-10000
+    pub fn set_treasury(env: Env, caller: Address, treasury: Address, treasury_percentage_bps: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        if treasury_percentage_bps > 10_000 {
+            panic_with_error!(&env, FeeError::InvalidTreasuryPercentage);
+        }
+
+        env.storage().instance().set(&DataKey::TreasuryAddress, &treasury);
+        env.storage().instance().set(&DataKey::TreasuryFeePercentage, &treasury_percentage_bps);
+        FeeEvents::treasury_configured(&env, &caller, &treasury, treasury_percentage_bps);
+    }
+
+    /// Returns the treasury address if configured.
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryAddress)
+    }
+
+    /// Returns the treasury fee percentage.
+    pub fn get_treasury_percentage(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TreasuryFeePercentage)
+            .unwrap_or(0)
+    }
+
+    /// Returns total fees routed to treasury.
+    pub fn get_total_treasury_fees(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalTreasuryFees)
+            .unwrap_or(0)
+    }
+
+    /// Set rounding mode for fee calculations.
+    ///
+    /// Only callable by the admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The admin address
+    /// * `mode` - The rounding mode (Floor, Round, or Ceiling)
+    pub fn set_rounding_mode(env: Env, caller: Address, mode: RoundingMode) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::RoundingMode, &mode);
+        FeeEvents::rounding_mode_updated(&env, &caller, mode);
+    }
+
+    /// Get the current rounding mode.
+    pub fn get_rounding_mode(env: Env) -> RoundingMode {
+        Self::get_rounding_mode(&env)
+    }
+
+    /// Set fee category for a user for tracking purposes.
+    ///
+    /// Only callable by the admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The admin address
+    /// * `user` - The user address
+    /// * `category` - The fee category
+    pub fn set_user_fee_category(env: Env, caller: Address, user: Address, category: FeeCategory) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::FeeCategoryMap(user.clone()), &category);
+        FeeEvents::fee_category_configured(&env, &user, category);
+    }
+
+    /// Get fee category for a user.
+    pub fn get_user_fee_category(env: Env, user: Address) -> FeeCategory {
+        Self::get_user_category(&env, &user)
+    }
+
+    /// Get cumulative fees for a specific category.
+    pub fn get_category_fees(env: Env, category: FeeCategory) -> i128 {
+        Self::get_category_fees(&env, category)
+    }
+
+    /// Create a snapshot of current fee state.
+    ///
+    /// Captures the current totals for reporting and historical tracking.
+    /// Only callable by the admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The admin address
+    /// * `period_start` - Start timestamp of the period being snapshotted
+    pub fn create_fee_snapshot(env: Env, caller: Address, period_start: u64) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        if period_start == 0 {
+            panic_with_error!(&env, FeeError::InvalidSnapshotPeriod);
+        }
+
+        let now = env.ledger().timestamp();
+        let total_collected = Self::get_total_collected(env.clone());
+        let treasury_collected = Self::get_total_treasury_fees(env.clone());
+
+        let snapshot = FeeSnapshot {
+            total_collected,
+            treasury_collected,
+            distributed: total_collected - treasury_collected, // Approximate - remaining goes to distribution
+            created_at: now,
+            period_start,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeSnapshot(period_start), &snapshot);
+
+        // Update metadata
+        let mut metadata: SnapshotMetadata = env
+            .storage()
+            .instance()
+            .get(&DataKey::SnapshotMetadata)
+            .unwrap_or(SnapshotMetadata {
+                count: 0,
+                latest_timestamp: 0,
+            });
+        metadata.count = metadata.count.saturating_add(1);
+        metadata.latest_timestamp = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::SnapshotMetadata, &metadata);
+
+        FeeEvents::snapshot_created(&env, period_start, total_collected, treasury_collected);
+    }
+
+    /// Get a fee snapshot for a specific period.
+    pub fn get_fee_snapshot(env: Env, period_start: u64) -> Option<FeeSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeSnapshot(period_start))
+    }
+
+    /// Get snapshot metadata.
+    pub fn get_snapshot_metadata(env: Env) -> SnapshotMetadata {
+        env.storage()
+            .instance()
+            .get(&DataKey::SnapshotMetadata)
+            .unwrap_or(SnapshotMetadata {
+                count: 0,
+                latest_timestamp: 0,
+            })
     }
 
     /// Returns cumulative fees collected since deployment.
