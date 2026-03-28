@@ -36,6 +36,8 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 [[test]]
 name = "snapshot_tests"
 path = "tests/snapshot_tests.rs"
+
+[[test]]
 name = "memo_tests"
 path = "tests/memo_tests.rs"
 

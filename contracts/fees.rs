@@ -1,7 +1,99 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, Vec,
+    Env, String, Vec,
 };
+
+// =============================================================================
+// Priority Levels for Fee Calculation
+// =============================================================================
+
+/// Priority levels for transaction execution.
+/// Higher priority levels result in higher fees for faster execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[contracttype]
+pub enum PriorityLevel {
+    /// Low priority - lowest fees, slowest execution
+    Low = 0,
+    /// Medium priority - standard fees, normal execution (default)
+    Medium = 1,
+    /// High priority - higher fees, faster execution
+    High = 2,
+    /// Urgent priority - highest fees, fastest execution
+    Urgent = 3,
+}
+
+impl Default for PriorityLevel {
+    fn default() -> Self {
+        PriorityLevel::Medium
+    }
+}
+
+impl PriorityLevel {
+    /// Convert from u32 to PriorityLevel
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(PriorityLevel::Low),
+            1 => Some(PriorityLevel::Medium),
+            2 => Some(PriorityLevel::High),
+            3 => Some(PriorityLevel::Urgent),
+            _ => None,
+        }
+    }
+
+    /// Convert PriorityLevel to u32
+    pub fn to_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Configuration for priority-based fee multipliers.
+/// Each priority level has a multiplier applied to the base fee rate.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PriorityFeeConfig {
+    /// Multiplier for Low priority (e.g., 8000 = 0.8x, 80% of base fee)
+    pub low_multiplier_bps: u32,
+    /// Multiplier for Medium priority (e.g., 10000 = 1.0x, 100% of base fee)
+    pub medium_multiplier_bps: u32,
+    /// Multiplier for High priority (e.g., 15000 = 1.5x, 150% of base fee)
+    pub high_multiplier_bps: u32,
+    /// Multiplier for Urgent priority (e.g., 20000 = 2.0x, 200% of base fee)
+    pub urgent_multiplier_bps: u32,
+}
+
+impl Default for PriorityFeeConfig {
+    fn default() -> Self {
+        Self {
+            low_multiplier_bps: 8000,      // 0.8x - 20% discount
+            medium_multiplier_bps: 10000,  // 1.0x - base rate
+            high_multiplier_bps: 15000,    // 1.5x - 50% premium
+            urgent_multiplier_bps: 20000,  // 2.0x - 100% premium
+        }
+    }
+}
+
+impl PriorityFeeConfig {
+    /// Get the multiplier for a given priority level in basis points
+    pub fn get_multiplier_bps(&self, priority: PriorityLevel) -> u32 {
+        match priority {
+            PriorityLevel::Low => self.low_multiplier_bps,
+            PriorityLevel::Medium => self.medium_multiplier_bps,
+            PriorityLevel::High => self.high_multiplier_bps,
+            PriorityLevel::Urgent => self.urgent_multiplier_bps,
+        }
+    }
+
+    /// Validate that multipliers are in ascending order (higher priority = higher fee)
+    pub fn is_valid(&self) -> bool {
+        self.low_multiplier_bps <= self.medium_multiplier_bps
+            && self.medium_multiplier_bps <= self.high_multiplier_bps
+            && self.high_multiplier_bps <= self.urgent_multiplier_bps
+    }
+}
+
+// =============================================================================
+// Fee Structures
+// =============================================================================
 
 /// Represents a fee distribution recipient and their share.
 #[derive(Clone, Debug)]
@@ -34,6 +126,8 @@ pub enum DataKey {
     MinFee,
     /// Maximum fee threshold. Fees cannot exceed this value.
     MaxFee,
+    /// Priority fee configuration with multipliers for each priority level.
+    PriorityFeeConfig,
 }
 
 #[contracterror]
@@ -60,6 +154,10 @@ pub enum FeeError {
     InvalidFeeBound = 12,
     /// Max fee is less than min fee.
     InvalidFeeBoundRange = 13,
+    /// Invalid priority level provided.
+    InvalidPriorityLevel = 14,
+    /// Priority multiplier configuration is invalid (not in ascending order).
+    InvalidPriorityConfig = 15,
 }
 
 /// Events emitted by the fees contract.
@@ -82,11 +180,11 @@ impl FeeEvents {
         );
     }
 
-    pub fn fee_refunded(env: &Env, user: &Address, refund_amount: i128, reason: &str) {
+    pub fn fee_refunded(env: &Env, user: &Address, refund_amount: i128, reason: &String) {
         let topics = (symbol_short!("fee"), symbol_short!("refunded"));
         env.events().publish(
             topics,
-            (user.clone(), refund_amount, reason, env.ledger().timestamp()),
+            (user.clone(), refund_amount, reason.clone(), env.ledger().timestamp()),
         );
     }
 
@@ -99,7 +197,7 @@ impl FeeEvents {
     }
 
     pub fn fees_distributed(env: &Env, total_distributed: i128, recipient_count: u32) {
-        let topics = (symbol_short!("fee"), symbol_short!("distributed"));
+        let topics = (symbol_short!("fee"), symbol_short!("dist"));
         env.events().publish(
             topics,
             (total_distributed, recipient_count, env.ledger().timestamp()),
@@ -107,10 +205,52 @@ impl FeeEvents {
     }
 
     pub fn fee_bounds_configured(env: &Env, admin: &Address, min_fee: i128, max_fee: i128) {
-        let topics = (symbol_short!("fee"), symbol_short!("bounds_cfg"));
+        let topics = (symbol_short!("fee"), symbol_short!("bnd_cfg"));
         env.events().publish(
             topics,
             (admin.clone(), min_fee, max_fee, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn priority_config_updated(
+        env: &Env,
+        admin: &Address,
+        low_bps: u32,
+        medium_bps: u32,
+        high_bps: u32,
+        urgent_bps: u32,
+    ) {
+        let topics = (symbol_short!("fee"), symbol_short!("pri_cfg"));
+        env.events().publish(
+            topics,
+            (
+                admin.clone(),
+                low_bps,
+                medium_bps,
+                high_bps,
+                urgent_bps,
+                env.ledger().timestamp(),
+            ),
+        );
+    }
+
+    pub fn fee_deducted_with_priority(
+        env: &Env,
+        payer: &Address,
+        amount: i128,
+        fee: i128,
+        priority: PriorityLevel,
+    ) {
+        let topics = (symbol_short!("fee"), symbol_short!("ded_pri"));
+        env.events().publish(
+            topics,
+            (
+                payer.clone(),
+                amount,
+                fee,
+                priority.to_u32(),
+                env.ledger().timestamp(),
+            ),
         );
     }
 }
@@ -209,7 +349,7 @@ impl FeesContract {
         if amount <= 0 {
             panic_with_error!(&env, FeeError::InvalidAmount);
         }
-        let pct: u32 = Self::get_percentage(&env);
+        let pct: u32 = Self::get_percentage(env.clone());
         // [SEC-FEES-05] Checked arithmetic throughout.
         let mut fee = amount
             .checked_mul(pct as i128)
@@ -239,7 +379,69 @@ impl FeesContract {
         fee
     }
 
-    /// Deducts the configured fee from `amount`.
+    /// Calculates the fee for `amount` using the current percentage and priority level.
+    ///
+    /// Priority multipliers adjust the base fee rate:
+    /// - Low priority: discounted fee (e.g., 80% of base)
+    /// - Medium priority: base fee (100%)
+    /// - High priority: premium fee (e.g., 150% of base)
+    /// - Urgent priority: highest fee (e.g., 200% of base)
+    ///
+    /// Applies min/max fee bounds if configured.
+    ///
+    /// # Security
+    /// - [SEC-FEES-21] Priority configuration must be valid (ascending multipliers).
+    /// - [SEC-FEES-22] All arithmetic uses `checked_*` to prevent overflow.
+    pub fn calculate_fee_with_priority(env: Env, amount: i128, priority: PriorityLevel) -> i128 {
+        // [SEC-FEES-04] Reject non-positive amounts.
+        if amount <= 0 {
+            panic_with_error!(&env, FeeError::InvalidAmount);
+        }
+
+        let base_pct: u32 = Self::get_percentage(env.clone());
+        let priority_config: PriorityFeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriorityFeeConfig)
+            .unwrap_or_else(PriorityFeeConfig::default);
+
+        // Get the multiplier for the priority level
+        let multiplier_bps = priority_config.get_multiplier_bps(priority);
+
+        // Calculate adjusted fee rate: base_pct * multiplier / 10000
+        // This gives us the effective fee rate for the priority level
+        let adjusted_pct = (base_pct as u64 * multiplier_bps as u64 / 10_000) as u32;
+
+        // [SEC-FEES-05] Checked arithmetic throughout.
+        let mut fee = amount
+            .checked_mul(adjusted_pct as i128)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow))
+            .checked_div(10_000)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        // [SEC-FEES-18] Apply min/max fee bounds.
+        let min_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinFee)
+            .unwrap_or(0);
+        let max_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxFee)
+            .unwrap_or(i128::MAX);
+
+        if fee < min_fee {
+            fee = min_fee;
+        }
+        if fee > max_fee {
+            fee = max_fee;
+        }
+
+        fee
+    }
+
+    /// Deducts the configured fee from `amount` with a specified priority level.
     ///
     /// Returns `(net_amount, fee)` and updates the cumulative accounting.
     ///
@@ -259,7 +461,7 @@ impl FeesContract {
         // Ensure contract is initialized before proceeding.
         Self::require_initialized(&env);
 
-        let fee = Self::calculate_fee(&env, amount);
+        let fee = Self::calculate_fee(env.clone(), amount);
 
         // [SEC-FEES-07] Checked subtraction for net amount.
         let net = amount
@@ -298,6 +500,77 @@ impl FeesContract {
             .set(&DataKey::UserFeesAccrued(payer.clone()), &user_fees);
 
         FeeEvents::fee_deducted(&env, &payer, amount, fee);
+        (net, fee)
+    }
+
+    /// Deducts the configured fee from `amount` with a specified priority level.
+    ///
+    /// Returns `(net_amount, fee)` and updates the cumulative accounting.
+    /// Higher priority levels result in higher fees for faster execution.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `payer` - The address paying the fee
+    /// * `amount` - The amount to calculate fees on
+    /// * `priority` - The priority level (Low, Medium, High, Urgent)
+    ///
+    /// # Returns
+    /// Tuple of (net_amount, fee_charged)
+    ///
+    /// # Security
+    /// - [SEC-FEES-23] Same security guarantees as `deduct_fee`.
+    /// - [SEC-FEES-24] Priority level is used to adjust fee via configured multipliers.
+    pub fn deduct_fee_with_priority(
+        env: Env,
+        payer: Address,
+        amount: i128,
+        priority: PriorityLevel,
+    ) -> (i128, i128) {
+        // [SEC-FEES-06] Authenticate before any computation or state change.
+        payer.require_auth();
+
+        // Ensure contract is initialized before proceeding.
+        Self::require_initialized(&env);
+
+        let fee = Self::calculate_fee_with_priority(env.clone(), amount, priority);
+
+        // [SEC-FEES-07] Checked subtraction for net amount.
+        let net = amount
+            .checked_sub(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        let mut total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+
+        // [SEC-FEES-07] Checked addition for running total.
+        total = total
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &total);
+
+        // [SEC-FEES-08] Update per-user fee accrual tracking.
+        let mut user_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserFeesAccrued(payer.clone()))
+            .unwrap_or(0);
+
+        // [SEC-FEES-08] Checked addition for per-user total.
+        user_fees = user_fees
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::UserFeesAccrued(payer.clone()), &user_fees);
+
+        FeeEvents::fee_deducted_with_priority(&env, &payer, amount, fee, priority);
         (net, fee)
     }
 
@@ -354,7 +627,7 @@ impl FeesContract {
         caller: Address,
         user: Address,
         refund_amount: i128,
-        reason: &str,
+        reason: String,
     ) -> i128 {
         // [SEC-FEES-09] Authenticate before any computation or state change.
         caller.require_auth();
@@ -405,7 +678,7 @@ impl FeesContract {
             .instance()
             .set(&DataKey::UserFeesAccrued(user.clone()), &updated_user_fees);
 
-        FeeEvents::fee_refunded(&env, &user, refund_amount, reason);
+        FeeEvents::fee_refunded(&env, &user, refund_amount, &reason);
         refund_amount
     }
 
@@ -623,5 +896,86 @@ impl FeesContract {
             .instance()
             .get(&DataKey::MaxFee)
             .unwrap_or(i128::MAX)
+    }
+
+    // =========================================================================
+    // Priority Fee Configuration
+    // =========================================================================
+
+    /// Sets the priority fee multipliers.
+    ///
+    /// Priority multipliers determine how fees are adjusted based on transaction priority.
+    /// Higher priority levels should have higher multipliers for faster execution.
+    /// Only callable by the admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The address requesting configuration (must be admin)
+    /// * `low_multiplier_bps` - Multiplier for Low priority (e.g., 8000 = 0.8x)
+    /// * `medium_multiplier_bps` - Multiplier for Medium priority (e.g., 10000 = 1.0x)
+    /// * `high_multiplier_bps` - Multiplier for High priority (e.g., 15000 = 1.5x)
+    /// * `urgent_multiplier_bps` - Multiplier for Urgent priority (e.g., 20000 = 2.0x)
+    ///
+    /// # Security
+    /// - [SEC-FEES-25] `caller.require_auth()` ensures only authorized admins can configure.
+    /// - [SEC-FEES-26] Multipliers must be in ascending order (low <= medium <= high <= urgent).
+    pub fn set_priority_multipliers(
+        env: Env,
+        caller: Address,
+        low_multiplier_bps: u32,
+        medium_multiplier_bps: u32,
+        high_multiplier_bps: u32,
+        urgent_multiplier_bps: u32,
+    ) {
+        // [SEC-FEES-25] Authenticate before any state mutation.
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let config = PriorityFeeConfig {
+            low_multiplier_bps,
+            medium_multiplier_bps,
+            high_multiplier_bps,
+            urgent_multiplier_bps,
+        };
+
+        // [SEC-FEES-26] Validate multipliers are in ascending order.
+        if !config.is_valid() {
+            panic_with_error!(&env, FeeError::InvalidPriorityConfig);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PriorityFeeConfig, &config);
+
+        FeeEvents::priority_config_updated(
+            &env,
+            &caller,
+            low_multiplier_bps,
+            medium_multiplier_bps,
+            high_multiplier_bps,
+            urgent_multiplier_bps,
+        );
+    }
+
+    /// Returns the current priority fee configuration.
+    ///
+    /// # Returns
+    /// PriorityFeeConfig with multipliers for each priority level
+    pub fn get_priority_config(env: Env) -> PriorityFeeConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriorityFeeConfig)
+            .unwrap_or_else(PriorityFeeConfig::default)
+    }
+
+    /// Returns the multiplier for a specific priority level.
+    ///
+    /// # Arguments
+    /// * `priority` - The priority level to query
+    ///
+    /// # Returns
+    /// Multiplier in basis points (e.g., 15000 = 1.5x)
+    pub fn get_priority_multiplier(env: Env, priority: PriorityLevel) -> u32 {
+        let config = Self::get_priority_config(env.clone());
+        config.get_multiplier_bps(priority)
     }
 }

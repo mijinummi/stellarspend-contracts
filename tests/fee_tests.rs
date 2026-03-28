@@ -1,7 +1,6 @@
 use soroban_sdk::{
-    symbol_short,
     testutils::{Address as _, Events as _},
-    Address, Env, Vec,
+    Address, Env, String, Vec,
 };
 
 #[path = "../contracts/fees.rs"]
@@ -207,7 +206,7 @@ fn test_refund_fee_successful() {
     assert_eq!(client.get_total_collected(), 50);
     
     // Admin refunds 30 out of 50
-    let refunded = client.refund_fee(&admin, &user, &30, &"transaction_failed");
+    let refunded = client.refund_fee(&admin, &user, &30, &String::from_str(&env, "transaction_failed"));
     assert_eq!(refunded, 30);
     
     // User fee should be reduced to 20
@@ -226,7 +225,7 @@ fn test_refund_fee_full_refund() {
     assert_eq!(client.get_total_collected(), 50);
     
     // Admin refunds entire fee
-    let refunded = client.refund_fee(&admin, &user, &50, &"transaction_reversed");
+    let refunded = client.refund_fee(&admin, &user, &50, &String::from_str(&env, "transaction_reversed"));
     assert_eq!(refunded, 50);
     
     // User fee should be 0
@@ -244,7 +243,7 @@ fn test_refund_fee_invalid_amount_zero() {
     
     // Should panic on zero refund amount
     let result = std::panic::catch_unwind(|| {
-        client.refund_fee(&admin, &user, &0, &"invalid");
+        client.refund_fee(&admin, &user, &0, &String::from_str(&env, "invalid"));
     });
     assert!(result.is_err());
 }
@@ -259,7 +258,7 @@ fn test_refund_fee_invalid_amount_negative() {
     
     // Should panic on negative refund amount
     let result = std::panic::catch_unwind(|| {
-        client.refund_fee(&admin, &user, &-10, &"invalid");
+        client.refund_fee(&admin, &user, &-10, &String::from_str(&env, "invalid"));
     });
     assert!(result.is_err());
 }
@@ -275,7 +274,7 @@ fn test_refund_fee_insufficient_balance() {
     
     // Should panic when trying to refund more than accumulated
     let result = std::panic::catch_unwind(|| {
-        client.refund_fee(&admin, &user, &100, &"exceeds_balance");
+        client.refund_fee(&admin, &user, &100, &String::from_str(&env, "exceeds_balance"));
     });
     assert!(result.is_err());
 }
@@ -290,7 +289,7 @@ fn test_refund_fee_insufficient_balance_no_prior_fees() {
     
     // Should panic when trying to refund any amount
     let result = std::panic::catch_unwind(|| {
-        client.refund_fee(&admin, &user, &10, &"no_fees");
+        client.refund_fee(&admin, &user, &10, &String::from_str(&env, "no_fees"));
     });
     assert!(result.is_err());
 }
@@ -306,7 +305,7 @@ fn test_refund_fee_unauthorized() {
     
     // Should panic because attacker is not admin
     let result = std::panic::catch_unwind(|| {
-        client.refund_fee(&attacker, &user, &20, &"unauthorized");
+        client.refund_fee(&attacker, &user, &20, &String::from_str(&env, "unauthorized"));
     });
     assert!(result.is_err());
 }
@@ -326,7 +325,7 @@ fn test_refund_fee_multiple_users() {
     assert_eq!(client.get_total_collected(), 150);
     
     // Admin refunds user1 partially
-    client.refund_fee(&admin, &user1, &30, &"partial_refund");
+    client.refund_fee(&admin, &user1, &30, &String::from_str(&env, "partial_refund"));
     
     assert_eq!(client.get_user_fees_accrued(&user1), 20);
     assert_eq!(client.get_user_fees_accrued(&user2), 100);
@@ -344,17 +343,17 @@ fn test_refund_fee_multiple_refunds_same_user() {
     assert_eq!(client.get_total_collected(), 50);
     
     // First refund: 20
-    client.refund_fee(&admin, &user, &20, &"partial_refund_1");
+    client.refund_fee(&admin, &user, &20, &String::from_str(&env, "partial_refund_1"));
     assert_eq!(client.get_user_fees_accrued(&user), 30);
     assert_eq!(client.get_total_collected(), 30);
     
     // Second refund: 15
-    client.refund_fee(&admin, &user, &15, &"partial_refund_2");
+    client.refund_fee(&admin, &user, &15, &String::from_str(&env, "partial_refund_2"));
     assert_eq!(client.get_user_fees_accrued(&user), 15);
     assert_eq!(client.get_total_collected(), 15);
     
     // Final refund: remaining 15
-    client.refund_fee(&admin, &user, &15, &"final_refund");
+    client.refund_fee(&admin, &user, &15, &String::from_str(&env, "final_refund"));
     assert_eq!(client.get_user_fees_accrued(&user), 0);
     assert_eq!(client.get_total_collected(), 0);
 }
@@ -368,7 +367,7 @@ fn test_refund_fee_emits_event() {
     client.deduct_fee(&user, &1_000);
     
     // Admin refunds 30
-    client.refund_fee(&admin, &user, &30, &"transaction_failed");
+    client.refund_fee(&admin, &user, &30, &String::from_str(&env, "transaction_failed"));
     
     // Check event was emitted
     let events = env.events().all();
@@ -387,7 +386,7 @@ fn test_refund_fee_with_subsequent_transactions() {
     assert_eq!(client.get_user_fees_accrued(&user), 50);
     
     // Admin refunds 30
-    client.refund_fee(&admin, &user, &30, &"partial_refund");
+    client.refund_fee(&admin, &user, &30, &String::from_str(&env, "partial_refund"));
     assert_eq!(client.get_user_fees_accrued(&user), 20);
     
     // User makes another transaction, fee = 50
@@ -405,9 +404,9 @@ fn test_refund_fee_alternate_refund_reasons() {
     client.deduct_fee(&user, &1_000);
     
     // Refund with different reasons for audit trail
-    client.refund_fee(&admin, &user, &10, &"failed_transaction");
-    client.refund_fee(&admin, &user, &15, &"customer_complaint");
-    client.refund_fee(&admin, &user, &25, &"system_error");
+    client.refund_fee(&admin, &user, &10, &String::from_str(&env, "failed_transaction"));
+    client.refund_fee(&admin, &user, &15, &String::from_str(&env, "customer_complaint"));
+    client.refund_fee(&admin, &user, &25, &String::from_str(&env, "system_error"));
     
     assert_eq!(client.get_user_fees_accrued(&user), 0);
     assert_eq!(client.get_total_collected(), 0);
@@ -813,7 +812,7 @@ fn test_distribution_with_refunds_before_distribution() {
     assert_eq!(client.get_total_collected(), 50);
     
     // Refund partial fee: 20
-    client.refund_fee(&admin, &user, &20, &"partial_cancel");
+    client.refund_fee(&admin, &user, &20, &String::from_str(&env, "partial_cancel"));
     assert_eq!(client.get_total_collected(), 30);
     
     // Distribute remaining
@@ -1128,7 +1127,7 @@ fn test_fee_bounds_with_refunds() {
     assert_eq!(client.get_total_collected(), 100);
     
     // Refund partially
-    client.refund_fee(&admin, &user, &30, &"partial");
+    client.refund_fee(&admin, &user, &30, &String::from_str(&env, "partial"));
     assert_eq!(client.get_user_fees_accrued(&user), 70);
     assert_eq!(client.get_total_collected(), 70);
 }
