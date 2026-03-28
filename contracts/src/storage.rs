@@ -44,7 +44,85 @@ pub fn func_issue_196() {}
 // Acceptance Criteria met: Treasury tracked independently
 pub fn func_issue_192() {}
 
-// Solved #191: Feat(contract): implement fee discount expiration
-// Tasks implemented: Store expiration timestamps, Validate during fee calculation
-// Acceptance Criteria met: Expired discounts ignored, Active discounts applied
-pub fn func_issue_191() {}
+/// Solves #191: Feat(contract): implement fee discount expiration
+/// Enhances the tier system by adding expiration timestamps for discounts.
+/// - Expired discounts are ignored during fee calculation.
+/// - Active (non-expired) discounts are correctly applied.
+
+use soroban_sdk::{Env, Address, Symbol};
+
+/// Represents a fee discount with an expiration timestamp.
+#[derive(Clone, Debug)]
+pub struct FeeDiscount {
+    /// The discount rate in basis points (e.g., 500 = 5% discount).
+    pub discount_bps: u32,
+    /// The ledger timestamp at which this discount expires.
+    pub expires_at: u64,
+}
+
+/// Stores a fee discount for a given user with an expiration timestamp.
+///
+/// # Arguments
+/// * `env` - The Soroban environment.
+/// * `user` - The address of the user receiving the discount.
+/// * `discount_bps` - Discount rate in basis points (e.g., 500 = 5%).
+/// * `expires_at` - Ledger timestamp after which the discount is no longer valid.
+pub fn store_discount(env: &Env, user: &Address, discount_bps: u32, expires_at: u64) {
+    let key = Symbol::new(env, "fee_disc");
+
+    // Persist the discount rate and expiration as a tuple
+    env.storage().persistent().set(&(key.clone(), user.clone()), &(discount_bps, expires_at));
+
+    // Emit an event for off-chain tracking
+    env.events().publish(
+        (Symbol::new(env, "discount_stored"),),
+        (user.clone(), discount_bps, expires_at),
+    );
+}
+
+/// Retrieves the active (non-expired) discount for a user.
+/// Returns `Some(discount_bps)` if the discount is still valid,
+/// or `None` if the discount has expired or does not exist.
+///
+/// # Arguments
+/// * `env` - The Soroban environment.
+/// * `user` - The address of the user to look up.
+pub fn get_active_discount(env: &Env, user: &Address) -> Option<u32> {
+    let key = Symbol::new(env, "fee_disc");
+
+    // Attempt to load the stored discount tuple
+    let stored: Option<(u32, u64)> = env.storage().persistent().get(&(key.clone(), user.clone()));
+
+    match stored {
+        Some((discount_bps, expires_at)) => {
+            let now = env.ledger().timestamp();
+            if now <= expires_at {
+                // Discount is still active — apply it
+                Some(discount_bps)
+            } else {
+                // Discount has expired — ignore it
+                env.events().publish(
+                    (Symbol::new(env, "discount_expired"),),
+                    (user.clone(), discount_bps, expires_at),
+                );
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+/// Removes an expired or revoked discount for a user.
+///
+/// # Arguments
+/// * `env` - The Soroban environment.
+/// * `user` - The address of the user whose discount should be removed.
+pub fn remove_discount(env: &Env, user: &Address) {
+    let key = Symbol::new(env, "fee_disc");
+    env.storage().persistent().remove(&(key.clone(), user.clone()));
+
+    env.events().publish(
+        (Symbol::new(env, "discount_removed"),),
+        user.clone(),
+    );
+}
