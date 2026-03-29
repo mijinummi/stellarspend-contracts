@@ -279,6 +279,11 @@ impl FeeContract {
 
 	/// Preview the total fees for a batch of operations without mutating state.
 	///
+	/// This is a view/read method intended for clients to estimate the aggregate fee
+	/// they will be charged when submitting a batch via `collect_fee_batch`. It performs
+	/// identical validations (non-empty, size cap, per-item minimum and positivity) but
+	/// does not transfer tokens or write to storage.
+	///
 	/// Validations mirror `collect_fee_batch`:
 	/// - Batch must be non-empty and not exceed `MAX_BATCH_SIZE`
 	/// - Each item must be positive and meet the configured `min_fee`
