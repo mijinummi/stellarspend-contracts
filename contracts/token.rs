@@ -1,6 +1,6 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, Map, Vec, U256,
+    Address, Bytes, Env, Map, String, Symbol, Vec, U256,
 };
 
 #[derive(Clone)]
@@ -25,7 +25,7 @@ pub enum DataKey {
 pub struct TokenConfig {
     pub name: String,
     pub symbol: String,
-    pub decimals: u8,
+    pub decimals: u32,
     pub admin: Address,
     pub mint_cap: Option<i128>,
     pub burn_cap: Option<i128>,
@@ -138,23 +138,22 @@ impl TokenEvents {
     }
 
     pub fn mint_cap_reached(env: &Env, attempted: i128, cap: i128) {
-        let topics = (symbol_short!("mint"), symbol_short!("cap_reached"));
+        let topics = (symbol_short!("mint"), Symbol::new(env, "cap_reached"));
         env.events()
             .publish(topics, (attempted, cap, env.ledger().timestamp()));
     }
 
     pub fn burn_cap_reached(env: &Env, attempted: i128, cap: i128) {
-        let topics = (symbol_short!("burn"), symbol_short!("cap_reached"));
+        let topics = (symbol_short!("burn"), Symbol::new(env, "cap_reached"));
         env.events()
             .publish(topics, (attempted, cap, env.ledger().timestamp()));
     }
 
     pub fn supply_changed(env: &Env, new_supply: i128, change: i128, operation: &str) {
+        let op = String::from_str(env, operation);
         let topics = (symbol_short!("supply"), symbol_short!("changed"));
-        env.events().publish(
-            topics,
-            (new_supply, change, operation, env.ledger().timestamp()),
-        );
+        env.events()
+            .publish(topics, (new_supply, change, op, env.ledger().timestamp()));
     }
 
     pub fn minter_added(env: &Env, admin: &Address, minter: &Address) {
@@ -179,7 +178,7 @@ pub fn initialize_token(
     admin: Address,
     name: String,
     symbol: String,
-    decimals: u8,
+    decimals: u32,
     mint_cap: Option<i128>,
     burn_cap: Option<i128>,
 ) {
@@ -223,7 +222,7 @@ pub fn initialize_token(
         env.storage().instance().set(&DataKey::BurnCap, &cap);
     }
 
-    let config = TokenConfig {
+    let _config = TokenConfig {
         name: name.clone(),
         symbol: symbol.clone(),
         decimals,
@@ -302,7 +301,7 @@ pub fn mint(env: &Env, minter: Address, to: Address, amount: i128) -> U256 {
         panic_with_error!(env, TokenError::InvalidAmount);
     }
 
-    if to == Address::from_contract_id(env) {
+    if to == env.current_contract_address() {
         panic_with_error!(env, TokenError::ZeroAddress);
     }
 
@@ -458,7 +457,7 @@ pub fn transfer(env: &Env, from: Address, to: Address, amount: i128) {
         panic_with_error!(env, TokenError::InvalidAmount);
     }
 
-    if to == Address::from_contract_id(env) {
+    if to == env.current_contract_address() {
         panic_with_error!(env, TokenError::ZeroAddress);
     }
 
@@ -508,7 +507,7 @@ pub fn approve(env: &Env, owner: Address, spender: Address, amount: i128) {
         panic_with_error!(env, TokenError::InvalidAmount);
     }
 
-    if spender == Address::from_contract_id(env) {
+    if spender == env.current_contract_address() {
         panic_with_error!(env, TokenError::ZeroAddress);
     }
 
@@ -534,7 +533,7 @@ pub fn transfer_from(env: &Env, spender: Address, from: Address, to: Address, am
         panic_with_error!(env, TokenError::InvalidAmount);
     }
 
-    if to == Address::from_contract_id(env) {
+    if to == env.current_contract_address() {
         panic_with_error!(env, TokenError::ZeroAddress);
     }
 
@@ -685,9 +684,10 @@ fn generate_transaction_id(env: &Env) -> U256 {
 
     // Simple ID generation based on timestamp and sequence
     bytes[0..8].copy_from_slice(&timestamp.to_be_bytes());
-    bytes[8..16].copy_from_slice(&sequence.to_be_bytes());
+    bytes[8..12].copy_from_slice(&sequence.to_be_bytes());
 
-    U256::from_be_bytes(bytes)
+    let b = Bytes::from_array(env, &bytes);
+    U256::from_be_bytes(env, &b)
 }
 
 #[contract]
@@ -700,7 +700,7 @@ impl TokenContract {
         admin: Address,
         name: String,
         symbol: String,
-        decimals: u8,
+        decimals: u32,
         mint_cap: Option<i128>,
         burn_cap: Option<i128>,
     ) {

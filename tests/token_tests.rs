@@ -1,8 +1,20 @@
+use std::panic::AssertUnwindSafe;
+
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _},
-    Address, Env, String, U256,
+    Address, Env, String, Symbol, TryFromVal,
 };
+
+fn event_topics_contain_symbol(
+    env: &Env,
+    topics: &soroban_sdk::Vec<soroban_sdk::Val>,
+    sym: soroban_sdk::Symbol,
+) -> bool {
+    topics
+        .iter()
+        .any(|topic| sym == Symbol::try_from_val(env, &topic).unwrap_or(symbol_short!("")))
+}
 
 #[path = "../contracts/token.rs"]
 mod token;
@@ -12,7 +24,7 @@ use token::{
     TokenMetrics,
 };
 
-fn setup_token_contract() -> (Env, Address, TokenContractClient<'static>) {
+fn setup_token_contract() -> (Env, Address, Address, TokenContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -22,16 +34,16 @@ fn setup_token_contract() -> (Env, Address, TokenContractClient<'static>) {
     let admin = Address::generate(&env);
     let name = String::from_str(&env, "StellarSpend Token");
     let symbol = String::from_str(&env, "SPEND");
-    let decimals = 18u8;
+    let decimals = 18u32;
     let mint_cap = Some(1000000i128);
     let burn_cap = Some(500000i128);
 
     client.initialize(&admin, &name, &symbol, &decimals, &mint_cap, &burn_cap);
 
-    (env, admin, client)
+    (env, admin, contract_id, client)
 }
 
-fn setup_token_contract_no_caps() -> (Env, Address, TokenContractClient<'static>) {
+fn setup_token_contract_no_caps() -> (Env, Address, Address, TokenContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -41,16 +53,16 @@ fn setup_token_contract_no_caps() -> (Env, Address, TokenContractClient<'static>
     let admin = Address::generate(&env);
     let name = String::from_str(&env, "StellarSpend Token");
     let symbol = String::from_str(&env, "SPEND");
-    let decimals = 18u8;
+    let decimals = 18u32;
 
     client.initialize(&admin, &name, &symbol, &decimals, &None, &None);
 
-    (env, admin, client)
+    (env, admin, contract_id, client)
 }
 
 #[test]
 fn test_token_initialization() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     assert_eq!(client.get_admin(), admin);
     assert_eq!(client.total_supply(), 0);
@@ -65,12 +77,12 @@ fn test_token_initialization() {
 #[test]
 #[should_panic]
 fn test_double_initialization_fails() {
-    let (env, _admin, client) = setup_token_contract();
+    let (env, _admin, _token_contract, client) = setup_token_contract();
 
     let another_admin = Address::generate(&env);
     let name = String::from_str(&env, "Another Token");
     let symbol = String::from_str(&env, "OTHER");
-    client.initialize(&another_admin, &name, &symbol, &18u8, &None, &None);
+    client.initialize(&another_admin, &name, &symbol, &18u32, &None, &None);
 }
 
 #[test]
@@ -86,40 +98,40 @@ fn test_invalid_initialization_fails() {
     let name = String::from_str(&env, ""); // Empty name
     let symbol = String::from_str(&env, "TEST");
 
-    client.initialize(&admin, &name, &symbol, &18u8, &None, &None);
+    client.initialize(&admin, &name, &symbol, &18u32, &None, &None);
 }
 
 #[test]
 fn test_admin_mint_success() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let recipient = Address::generate(&env);
     let amount = 1000i128;
 
-    let transaction_id = client.mint(&admin, &recipient, &amount);
+    let _transaction_id = client.mint(&admin, &recipient, &amount);
 
-    assert_eq!(client.balance(&recipient), amount);
-    assert_eq!(client.total_supply(), amount);
-    assert_eq!(client.total_minted(), amount);
-
-    // Check events
+    // Assert on events before further `client.*` calls (SDK 22 clears the event buffer per invocation).
     let events = env.events().all();
     let mint_events = events
         .iter()
         .filter(|event| {
             event.1.iter().any(|topic| {
                 symbol_short!("mint")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
+                    == Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
             })
         })
         .count();
     assert_eq!(mint_events, 1);
+
+    assert_eq!(client.balance(&recipient), amount);
+    assert_eq!(client.total_supply(), amount);
+    assert_eq!(client.total_minted(), amount);
 }
 
 #[test]
 #[should_panic]
 fn test_unauthorized_mint_fails() {
-    let (env, _admin, client) = setup_token_contract();
+    let (env, _admin, _token_contract, client) = setup_token_contract();
 
     let unauthorized = Address::generate(&env);
     let recipient = Address::generate(&env);
@@ -131,7 +143,7 @@ fn test_unauthorized_mint_fails() {
 #[test]
 #[should_panic]
 fn test_mint_invalid_amount_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let recipient = Address::generate(&env);
     let amount = 0i128; // Invalid amount
@@ -142,7 +154,7 @@ fn test_mint_invalid_amount_fails() {
 #[test]
 #[should_panic]
 fn test_mint_negative_amount_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let recipient = Address::generate(&env);
     let amount = -100i128; // Negative amount
@@ -153,18 +165,17 @@ fn test_mint_negative_amount_fails() {
 #[test]
 #[should_panic]
 fn test_mint_to_zero_address_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, token_contract, client) = setup_token_contract();
 
-    let zero_address = Address::from_contract_id(&env);
     let amount = 1000i128;
 
-    client.mint(&admin, &zero_address, &amount);
+    client.mint(&admin, &token_contract, &amount);
 }
 
 #[test]
 #[should_panic]
 fn test_mint_cap_exceeded_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let recipient = Address::generate(&env);
     let amount = 2000000i128; // Exceeds cap of 1000000
@@ -174,7 +185,7 @@ fn test_mint_cap_exceeded_fails() {
 
 #[test]
 fn test_mint_cap_respected() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let recipient = Address::generate(&env);
 
@@ -186,15 +197,15 @@ fn test_mint_cap_respected() {
     assert_eq!(client.total_minted(), 1000000i128);
 
     // Next mint should fail
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.mint(&admin, &recipient, &1i128);
-    });
+    }));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_burn_success() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let mint_amount = 2000i128;
@@ -207,28 +218,27 @@ fn test_burn_success() {
     // Then burn some
     client.burn(&user, &burn_amount);
 
-    assert_eq!(client.balance(&user), mint_amount - burn_amount);
-    assert_eq!(client.total_supply(), mint_amount - burn_amount);
-    assert_eq!(client.total_burned(), burn_amount);
-
-    // Check events
     let events = env.events().all();
     let burn_events = events
         .iter()
         .filter(|event| {
             event.1.iter().any(|topic| {
                 symbol_short!("burn")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
+                    == Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
             })
         })
         .count();
     assert_eq!(burn_events, 1);
+
+    assert_eq!(client.balance(&user), mint_amount - burn_amount);
+    assert_eq!(client.total_supply(), mint_amount - burn_amount);
+    assert_eq!(client.total_burned(), burn_amount);
 }
 
 #[test]
 #[should_panic]
 fn test_burn_insufficient_balance_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let mint_amount = 1000i128;
@@ -241,7 +251,7 @@ fn test_burn_insufficient_balance_fails() {
 #[test]
 #[should_panic]
 fn test_burn_invalid_amount_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let mint_amount = 1000i128;
@@ -255,7 +265,7 @@ fn test_burn_invalid_amount_fails() {
 #[test]
 #[should_panic]
 fn test_burn_negative_amount_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let mint_amount = 1000i128;
@@ -269,7 +279,7 @@ fn test_burn_negative_amount_fails() {
 #[test]
 #[should_panic]
 fn test_burn_cap_exceeded_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -290,7 +300,7 @@ fn test_burn_cap_exceeded_fails() {
 
 #[test]
 fn test_transfer_success() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -304,27 +314,26 @@ fn test_transfer_success() {
     // Transfer from user1 to user2
     client.transfer(&user1, &user2, &amount);
 
-    assert_eq!(client.balance(&user1), 0);
-    assert_eq!(client.balance(&user2), amount);
-
-    // Check events
     let events = env.events().all();
     let transfer_events = events
         .iter()
         .filter(|event| {
             event.1.iter().any(|topic| {
                 symbol_short!("transfer")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
+                    == Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
             })
         })
         .count();
     assert_eq!(transfer_events, 1);
+
+    assert_eq!(client.balance(&user1), 0);
+    assert_eq!(client.balance(&user2), amount);
 }
 
 #[test]
 #[should_panic]
 fn test_transfer_insufficient_balance_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -338,7 +347,7 @@ fn test_transfer_insufficient_balance_fails() {
 #[test]
 #[should_panic]
 fn test_transfer_invalid_amount_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -351,19 +360,18 @@ fn test_transfer_invalid_amount_fails() {
 #[test]
 #[should_panic]
 fn test_transfer_to_zero_address_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
-    let zero_address = Address::from_contract_id(&env);
     let amount = 1000i128;
 
     client.mint(&admin, &user1, &amount);
-    client.transfer(&user1, &zero_address, &amount);
+    client.transfer(&user1, &token_contract, &amount);
 }
 
 #[test]
 fn test_approve_success() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let owner = Address::generate(&env);
     let spender = Address::generate(&env);
@@ -375,25 +383,24 @@ fn test_approve_success() {
     // Approve spender
     client.approve(&owner, &spender, &amount);
 
-    assert_eq!(client.allowance(&owner, &spender), amount);
-
-    // Check events
     let events = env.events().all();
     let approval_events = events
         .iter()
         .filter(|event| {
             event.1.iter().any(|topic| {
                 symbol_short!("approval")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
+                    == Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
             })
         })
         .count();
     assert_eq!(approval_events, 1);
+
+    assert_eq!(client.allowance(&owner, &spender), amount);
 }
 
 #[test]
 fn test_transfer_from_success() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let owner = Address::generate(&env);
     let spender = Address::generate(&env);
@@ -417,7 +424,7 @@ fn test_transfer_from_success() {
 #[test]
 #[should_panic]
 fn test_transfer_from_insufficient_allowance_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let owner = Address::generate(&env);
     let spender = Address::generate(&env);
@@ -438,7 +445,7 @@ fn test_transfer_from_insufficient_allowance_fails() {
 
 #[test]
 fn test_minter_management() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let minter = Address::generate(&env);
     let recipient = Address::generate(&env);
@@ -460,16 +467,16 @@ fn test_minter_management() {
     assert!(!client.is_minter(&minter));
 
     // Should no longer be able to mint
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.mint(&minter, &recipient, &1000i128);
-    });
+    }));
     assert!(result.is_err());
 }
 
 #[test]
 #[should_panic]
 fn test_unauthorized_minter_management_fails() {
-    let (env, _admin, client) = setup_token_contract();
+    let (env, _admin, _token_contract, client) = setup_token_contract();
 
     let unauthorized = Address::generate(&env);
     let minter = Address::generate(&env);
@@ -480,14 +487,14 @@ fn test_unauthorized_minter_management_fails() {
 #[test]
 #[should_panic]
 fn test_remove_admin_as_minter_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     client.remove_minter(&admin, &admin);
 }
 
 #[test]
 fn test_pause_unpause_functionality() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let amount = 1000i128;
@@ -501,19 +508,19 @@ fn test_pause_unpause_functionality() {
     assert!(client.is_paused());
 
     // Operations should fail when paused
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.mint(&admin, &user, &amount);
-    });
+    }));
     assert!(result.is_err());
 
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.transfer(&user, &user, &amount);
-    });
+    }));
     assert!(result.is_err());
 
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.burn(&user, &amount);
-    });
+    }));
     assert!(result.is_err());
 
     // Unpause contract
@@ -529,7 +536,7 @@ fn test_pause_unpause_functionality() {
 #[test]
 #[should_panic]
 fn test_unauthorized_pause_fails() {
-    let (env, _admin, client) = setup_token_contract();
+    let (env, _admin, _token_contract, client) = setup_token_contract();
 
     let unauthorized = Address::generate(&env);
     client.pause(&unauthorized);
@@ -538,7 +545,7 @@ fn test_unauthorized_pause_fails() {
 #[test]
 #[should_panic]
 fn test_unauthorized_unpause_fails() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let unauthorized = Address::generate(&env);
 
@@ -551,7 +558,7 @@ fn test_unauthorized_unpause_fails() {
 
 #[test]
 fn test_token_metrics() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -571,7 +578,7 @@ fn test_token_metrics() {
 
 #[test]
 fn test_no_caps_token() {
-    let (env, admin, client) = setup_token_contract_no_caps();
+    let (env, admin, _token_contract, client) = setup_token_contract_no_caps();
 
     let recipient = Address::generate(&env);
     let amount = 1000000i128;
@@ -592,7 +599,7 @@ fn test_no_caps_token() {
 
 #[test]
 fn test_overflow_protection_mint() {
-    let (env, admin, client) = setup_token_contract_no_caps();
+    let (env, admin, _token_contract, client) = setup_token_contract_no_caps();
 
     let recipient = Address::generate(&env);
 
@@ -600,15 +607,15 @@ fn test_overflow_protection_mint() {
     client.mint(&admin, &recipient, &i128::MAX);
 
     // Trying to mint more should cause overflow
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.mint(&admin, &recipient, &1i128);
-    });
+    }));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_underflow_protection_burn() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let amount = 1000i128;
@@ -620,15 +627,15 @@ fn test_underflow_protection_burn() {
     assert_eq!(client.balance(&user), 0);
 
     // Trying to burn more should cause underflow
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         client.burn(&user, &1i128);
-    });
+    }));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_zero_balance_cleanup() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user = Address::generate(&env);
     let amount = 1000i128;
@@ -650,7 +657,7 @@ fn test_zero_balance_cleanup() {
 
 #[test]
 fn test_multiple_minters() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let minter1 = Address::generate(&env);
     let minter2 = Address::generate(&env);
@@ -675,7 +682,7 @@ fn test_multiple_minters() {
 
 #[test]
 fn test_complex_scenario() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
@@ -711,7 +718,7 @@ fn test_complex_scenario() {
 
 #[test]
 fn test_edge_case_maximum_values() {
-    let (env, admin, client) = setup_token_contract_no_caps();
+    let (env, admin, _token_contract, client) = setup_token_contract_no_caps();
 
     let recipient = Address::generate(&env);
     let max_amount = i128::MAX;
@@ -727,7 +734,7 @@ fn test_edge_case_maximum_values() {
 
 #[test]
 fn test_edge_case_minimum_values() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let recipient = Address::generate(&env);
     let min_amount = 1i128;
@@ -743,83 +750,44 @@ fn test_edge_case_minimum_values() {
 
 #[test]
 fn test_event_emission_comprehensive() {
-    let (env, admin, client) = setup_token_contract();
+    let (env, admin, _token_contract, client) = setup_token_contract();
 
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
     let minter = Address::generate(&env);
 
-    // Add minter
     client.add_minter(&admin, &minter);
+    assert!(env
+        .events()
+        .all()
+        .iter()
+        .any(|ev| { event_topics_contain_symbol(&env, &ev.1, symbol_short!("minter")) }));
 
-    // Mint tokens
     client.mint(&minter, &user1, &1000i128);
+    assert!(env
+        .events()
+        .all()
+        .iter()
+        .any(|ev| { event_topics_contain_symbol(&env, &ev.1, symbol_short!("mint")) }));
 
-    // Transfer tokens
     client.transfer(&user1, &user2, &500i128);
+    assert!(env
+        .events()
+        .all()
+        .iter()
+        .any(|ev| { event_topics_contain_symbol(&env, &ev.1, symbol_short!("transfer")) }));
 
-    // Approve allowance
     client.approve(&user2, &user1, &200i128);
+    assert!(env
+        .events()
+        .all()
+        .iter()
+        .any(|ev| { event_topics_contain_symbol(&env, &ev.1, symbol_short!("approval")) }));
 
-    // Burn tokens
     client.burn(&user2, &100i128);
-
-    // Check all events were emitted
-    let events = env.events().all();
-
-    let minter_added_events = events
+    assert!(env
+        .events()
+        .all()
         .iter()
-        .filter(|event| {
-            event.1.iter().any(|topic| {
-                symbol_short!("added")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
-            })
-        })
-        .count();
-
-    let mint_events = events
-        .iter()
-        .filter(|event| {
-            event.1.iter().any(|topic| {
-                symbol_short!("mint")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
-            })
-        })
-        .count();
-
-    let transfer_events = events
-        .iter()
-        .filter(|event| {
-            event.1.iter().any(|topic| {
-                symbol_short!("transfer")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
-            })
-        })
-        .count();
-
-    let approval_events = events
-        .iter()
-        .filter(|event| {
-            event.1.iter().any(|topic| {
-                symbol_short!("approval")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
-            })
-        })
-        .count();
-
-    let burn_events = events
-        .iter()
-        .filter(|event| {
-            event.1.iter().any(|topic| {
-                symbol_short!("burn")
-                    == soroban_sdk::Symbol::try_from_val(&env, &topic).unwrap_or(symbol_short!(""))
-            })
-        })
-        .count();
-
-    assert_eq!(minter_added_events, 1);
-    assert_eq!(mint_events, 1);
-    assert_eq!(transfer_events, 1);
-    assert_eq!(approval_events, 1);
-    assert_eq!(burn_events, 1);
+        .any(|ev| { event_topics_contain_symbol(&env, &ev.1, symbol_short!("burn")) }));
 }
