@@ -246,6 +246,15 @@ fn test_contract_initialization() {
     assert_eq!(priority_config.medium_multiplier_bps, 10000);
     assert_eq!(priority_config.high_multiplier_bps, 15000);
     assert_eq!(priority_config.urgent_multiplier_bps, 20000);
+
+    let events = env.events().all();
+    let event = events
+        .iter()
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("init"))
+        .expect("initialize event should be emitted");
+    assert_eq!(event.topics.2, admin.clone());
+    assert_eq!(event.topics.3, 500i128);
 }
 
 #[test]
@@ -420,10 +429,16 @@ fn test_deduct_fee_with_priority() {
     assert_eq!(fee, 1500);
     assert_eq!(net, 8500);
     assert_eq!(FeeContract::get_total_collected(env.clone()), 1500);
-    assert_eq!(
-        FeeContract::get_user_fees_accrued(env.clone(), payer.clone()),
-        1500
-    );
+    assert_eq!(FeeContract::get_user_fees_accrued(env.clone(), payer.clone()), 1500);
+
+    let events = env.events().all();
+    let event = events
+        .iter()
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("deduct"))
+        .expect("deduction event should be emitted");
+    assert_eq!(event.topics.2, payer.clone());
+    assert_eq!(event.topics.3, amount);
 }
 
 #[test]
@@ -490,9 +505,15 @@ fn test_priority_fee_events() {
 
     // Check event was emitted
     let events = env.events().all();
-    assert!(events
+    assert!(events.iter().any(|e| e.topics.0 == symbol_short!("fee") 
+        && e.topics.1 == symbol_short!("pri_cfg")));
+    let event = events
         .iter()
-        .any(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("pri_cfg")));
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("pri_cfg"))
+        .expect("priority config event should be emitted");
+    assert_eq!(event.topics.2, admin.clone());
+    assert_eq!(event.topics.3, 10000i128);
 }
 
 // =============================================================================
@@ -691,6 +712,15 @@ fn test_set_and_get_asset_fee_config() {
     assert_eq!(config.min_fee, 0);
     assert_eq!(config.max_fee, 0);
     assert_eq!(config.asset, asset);
+
+    let events = env.events().all();
+    let event = events
+        .iter()
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("ast_cfg"))
+        .expect("asset config event should be emitted");
+    assert_eq!(event.topics.2, admin.clone());
+    assert_eq!(event.topics.3, 200i128);
 }
 
 #[test]
@@ -891,6 +921,15 @@ fn test_deduct_asset_fee_tracks_balances_independently() {
 
     // Global total includes both
     assert_eq!(FeeContract::get_total_collected(env.clone()), 300);
+
+    let events = env.events().all();
+    let event = events
+        .iter()
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("ast_ded"))
+        .expect("asset deduction event should be emitted");
+    assert_eq!(event.topics.2, payer.clone());
+    assert_eq!(event.topics.3, 10_000i128);
 }
 
 #[test]
@@ -1055,11 +1094,6 @@ fn test_deduct_batch_fees_aggregates_correctly() {
     client.set_asset_fee_config(&admin, &usdc, &200u32, &0i128, &0i128);
 
     let mut txs: Vec<FeeTransaction> = Vec::new(&env);
-    FeeContract::initialize(env.clone(), admin.clone(), 100); // 1% default
-    FeeContract::set_asset_fee_config(env.clone(), admin.clone(), xlm.clone(), 100, 0, 0); // 1%
-    FeeContract::set_asset_fee_config(env.clone(), admin.clone(), usdc.clone(), 200, 0, 0); // 2%
-
-    let mut txs: Vec<FeeTransaction> = Vec::new(&env);
     // payer_a pays 1% on 10_000 XLM at medium priority  -> fee 100
     txs.push_back(make_tx(
         payer_a.clone(),
@@ -1067,7 +1101,6 @@ fn test_deduct_batch_fees_aggregates_correctly() {
         10_000,
         PriorityLevel::Medium,
     )); // fee 100
-    ));
     // payer_b pays 2% on 5_000 USDC at medium priority  -> fee 100
     txs.push_back(make_tx(
         payer_b.clone(),
@@ -1075,7 +1108,6 @@ fn test_deduct_batch_fees_aggregates_correctly() {
         5_000,
         PriorityLevel::Medium,
     )); // fee 100
-    ));
     // payer_a pays 1% * 2.0 (urgent) on 10_000 XLM     -> fee 200
     txs.push_back(make_tx(
         payer_a.clone(),
@@ -1083,7 +1115,6 @@ fn test_deduct_batch_fees_aggregates_correctly() {
         10_000,
         PriorityLevel::Urgent,
     )); // fee 200
-    ));
 
     let result = client.deduct_batch_fees(&txs);
 
@@ -1367,9 +1398,28 @@ fn test_deduct_batch_fees_emits_batch_event() {
     FeeContract::deduct_batch_fees(env.clone(), txs);
 
     let events = env.events().all();
-    assert!(events
+    assert!(events.iter().any(|e| {
+        e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("batch")
+    }));
+    assert!(events.iter().any(|e| {
+        e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("bat_itm")
+    }));
+
+    let item_event = events
         .iter()
-        .any(|e| { e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("batch") }));
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("bat_itm"))
+        .expect("batch item event should be emitted");
+    assert_eq!(item_event.topics.2, payer.clone());
+    assert_eq!(item_event.topics.3, 10_000i128);
+
+    let summary_event = events
+        .iter()
+        .rev()
+        .find(|e| e.topics.0 == symbol_short!("fee") && e.topics.1 == symbol_short!("batch"))
+        .expect("batch summary event should be emitted");
+    assert_eq!(summary_event.topics.2, payer.clone());
+    assert_eq!(summary_event.topics.3, 200i128);
 }
 
 #[test]
@@ -1414,11 +1464,6 @@ fn test_calculate_batch_fees_mixed_assets_and_priorities() {
     client.set_asset_fee_config(&admin, &usdc, &300u32, &0i128, &0i128); // 3%
 
     let mut txs: Vec<FeeTransaction> = Vec::new(&env);
-    FeeContract::initialize(env.clone(), admin.clone(), 100); // 1% default
-    FeeContract::set_asset_fee_config(env.clone(), admin.clone(), xlm.clone(), 50, 0, 0); // 0.5%
-    FeeContract::set_asset_fee_config(env.clone(), admin.clone(), usdc.clone(), 300, 0, 0); // 3%
-
-    let mut txs: Vec<FeeTransaction> = Vec::new(&env);
     // XLM  0.5% * 1.0 (medium) of 20000 = 100
     txs.push_back(make_tx(
         payer.clone(),
@@ -1426,7 +1471,6 @@ fn test_calculate_batch_fees_mixed_assets_and_priorities() {
         20_000,
         PriorityLevel::Medium,
     )); // 0.5%*1.0=100
-    ));
     // USDC 3% * 2.0 (urgent) of 10000 = 600
     txs.push_back(make_tx(
         payer.clone(),
@@ -1434,7 +1478,6 @@ fn test_calculate_batch_fees_mixed_assets_and_priorities() {
         10_000,
         PriorityLevel::Urgent,
     )); // 3%*2.0=600
-    ));
     // unconfigured falls back to 1% default, low priority 0.8 = 0.8% of 5000 = 40
     txs.push_back(make_tx(
         payer.clone(),
@@ -1442,9 +1485,6 @@ fn test_calculate_batch_fees_mixed_assets_and_priorities() {
         5_000,
         PriorityLevel::Low,
     )); // 1%*0.8=40
-
-    let result = client.calculate_batch_fees(&txs);
-    ));
 
     let result = FeeContract::calculate_batch_fees(env.clone(), txs);
 
