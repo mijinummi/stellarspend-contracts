@@ -10,6 +10,23 @@
 //! - **Atomic Operations**: Ensures reliable state changes
 //!
 #![no_std]
+use soroban_sdk::{contractimpl, Env, Address};
+
+pub struct BudgetContract;
+
+#[contractimpl]
+impl BudgetContract {
+    /// Set a budget limit for a given user
+    pub fn set_budget(env: Env, user: Address, amount: i128) {
+        // Store under a key derived from user address
+        env.storage().set(&user, &amount);
+    }
+
+    /// Get the budget limit for a given user
+    pub fn get_budget(env: Env, user: Address) -> i128 {
+        env.storage().get(&user).unwrap_or(0)
+    }
+}
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, panic_with_error};
 
